@@ -119,6 +119,18 @@ const USER_HTML = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>立即发送</h2>
+    <p class="sub">不等到点，立刻生成或直发一条消息到你的飞书</p>
+    <label>一次性提示词（按人设让 AI 生成后发送）</label>
+    <textarea id="oncePrompt" placeholder="例如：余余今天考砸了不开心，帮我安慰她"></textarea>
+    <button class="btn ghost" id="btnOnce" style="margin-top:10px;">生成并发送</button>
+    <label style="margin-top:16px;">直接发送（原样发到飞书，不走 AI）</label>
+    <input type="text" id="directText" placeholder="例如：hi">
+    <button class="btn ghost" id="btnDirect" style="margin-top:10px;">直接发送</button>
+    <p class="hint" id="sendMsg" style="min-height:16px;"></p>
+  </div>
+
+  <div class="card">
     <h2>接收人</h2>
     <p class="sub">谁收到消息（你飞书账号绑定的邮箱 / 手机号）</p>
     <label>接收邮箱</label>
@@ -357,6 +369,38 @@ el('resetBtn').addEventListener('click', function(){
 
 el('logoutBtn').addEventListener('click', function(){
   fetch('/api/logout', { method:'POST' }).then(function(){ location.href = '/'; });
+});
+
+function setSendMsg(t){ if(el('sendMsg')) el('sendMsg').textContent = t; }
+
+el('btnOnce').addEventListener('click', function(){
+  var prompt = (el('oncePrompt') ? el('oncePrompt').value : '').trim();
+  if(!prompt){ alert('请先输入提示词'); return; }
+  el('btnOnce').disabled = true;
+  setSendMsg('正在生成…');
+  fetch('/api/once', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt: prompt }) })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      el('btnOnce').disabled = false;
+      if(res && res.ok){ setSendMsg('已发送 ✓'); el('oncePrompt').value = ''; }
+      else { setSendMsg('失败：' + ((res && res.msg) ? res.msg : JSON.stringify(res))); }
+    })
+    .catch(function(e){ el('btnOnce').disabled = false; setSendMsg('失败：' + e); });
+});
+
+el('btnDirect').addEventListener('click', function(){
+  var text = (el('directText') ? el('directText').value : '').trim();
+  if(!text){ alert('请输入要发送的内容'); return; }
+  el('btnDirect').disabled = true;
+  setSendMsg('正在发送…');
+  fetch('/api/direct', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: text }) })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      el('btnDirect').disabled = false;
+      if(res && res.ok){ setSendMsg('已发送 ✓'); el('directText').value = ''; }
+      else { setSendMsg('失败：' + ((res && res.msg) ? res.msg : JSON.stringify(res))); }
+    })
+    .catch(function(e){ el('btnDirect').disabled = false; setSendMsg('失败：' + e); });
 });
 
 load();
@@ -696,6 +740,42 @@ export default {
       await putUser(env, u.code, u.cfg);
       return json({ ok: true });
     }
+    if (p === '/api/once' && request.method === 'POST') {
+      const u = await getUserFromCookie(request, env);
+      if (!u) return json({ msg: '未登录' }, 401);
+      const eff = await effectiveConfig(env, u.cfg);
+      const prompt = String((await readJson(request)).prompt || '').trim();
+      if (!prompt) return json({ ok: false, msg: '提示词不能为空' });
+      if (!eff.apiKey || !(eff.receiverEmail || eff.receiverMobile || eff.openId) || !eff.feishu || !eff.feishu.appId || !eff.feishu.appSecret) {
+        return json({ ok: false, msg: '请先填好接收人与凭据并保存' });
+      }
+      try {
+        const p = buildOncePrompt(eff.persona, prompt, beijingNow());
+        const text = await callDeepSeek(eff.apiKey, p.system, p.user, p.temperature, p.maxTokens);
+        const resp = await sendTextToReceiver(eff, text);
+        if (resp && resp.code !== 0) return json({ ok: false, msg: '发送失败 code=' + resp.code + '：' + (resp.msg || '未知') });
+        return json({ ok: true, text: text });
+      } catch (e) {
+        return json({ ok: false, msg: (e && e.message) ? e.message : String(e) });
+      }
+    }
+    if (p === '/api/direct' && request.method === 'POST') {
+      const u = await getUserFromCookie(request, env);
+      if (!u) return json({ msg: '未登录' }, 401);
+      const eff = await effectiveConfig(env, u.cfg);
+      const text = String((await readJson(request)).text || '').trim();
+      if (!text) return json({ ok: false, msg: '内容不能为空' });
+      if (!(eff.receiverEmail || eff.receiverMobile || eff.openId) || !eff.feishu || !eff.feishu.appId || !eff.feishu.appSecret) {
+        return json({ ok: false, msg: '请先填好接收人与飞书凭据并保存' });
+      }
+      try {
+        const resp = await sendTextToReceiver(eff, text);
+        if (resp && resp.code !== 0) return json({ ok: false, msg: '发送失败 code=' + resp.code + '：' + (resp.msg || '未知') });
+        return json({ ok: true, text: text });
+      } catch (e) {
+        return json({ ok: false, msg: (e && e.message) ? e.message : String(e) });
+      }
+    }
 
     // 管理员接口
     if (p === '/api/system') {
@@ -930,6 +1010,14 @@ async function sendMessage(token, receiveType, receiveId, text) {
   return resp.json();
 }
 
+async function sendTextToReceiver(cfg, text) {
+  const token = await getFeishuToken(cfg);
+  const userId = await resolveUserId(cfg, token);
+  const receiveType = userId ? 'open_id' : (cfg.receiverEmail ? 'email' : 'open_id');
+  const receiveId = userId || cfg.receiverEmail || cfg.openId;
+  return await sendMessage(token, receiveType, receiveId, text);
+}
+
 async function callDeepSeek(apiKey, system, user, temperature, maxTokens) {
   const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
     method: 'POST',
@@ -1016,6 +1104,25 @@ function buildPrompt(persona, ci, now) {
     user: persona.name + '。',
     temperature: ci.isRandom ? 1.0 : 1.2,
     maxTokens: ci.isRandom ? 150 : 600
+  };
+}
+
+function buildOncePrompt(persona, userPrompt, now) {
+  const month = now.getMonth() + 1;
+  const day = now.getDate();
+  const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const weekday = weekdays[now.getDay()];
+  const period = periodName(now.getHours());
+
+  const iron = '【时差铁律-最高优先级】你在' + persona.theirLocation + '，' + persona.userName + '在' + persona.yourLocation + '，你们有时差。绝对不要用你的时间去想' + persona.userName + '在干嘛，也绝对不要在消息里报时、提你那边几点、提凌晨深夜。时间只是给你组织语气的参考。';
+  const person = '你是' + persona.name + '，' + persona.intro + '。' + persona.relationship + '。你叫对方' + persona.userName + '。性格：' + persona.personality + ' 说话风格：' + persona.style + ' 硬性规则：' + persona.rules + ' 生活细节：' + persona.lifestyle;
+  const timeHint = '今天是' + month + '月' + day + '日' + weekday + '。' + persona.userName + '那边现在是' + period + '。';
+  const system = iron + person + timeHint + persona.userName + '现在发来一条请求：' + userPrompt + '。请完全保持你的人设和语气，以' + persona.name + '的身份直接回应她——直接说出口，不要任何解释或旁白。';
+  return {
+    system: system,
+    user: persona.name + '。',
+    temperature: 1.0,
+    maxTokens: 600
   };
 }
 
