@@ -1,0 +1,12 @@
+name = "laixin-bot"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# 定时调度：每分钟检查一次（按北京时间）
+[triggers]
+crons = ["* * * * *"]
+
+# 存储配置与状态（需创建 KV 命名空间后填 id）
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "78e0c6acc287472587866b1edaa7e490"

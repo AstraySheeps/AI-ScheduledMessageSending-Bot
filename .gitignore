@@ -1,0 +1,9 @@
+# Cloudflare wrangler 本地缓存与登录态
+.wrangler/
+
+# 初始脚本（内含真实 DeepSeek API Key，勿提交）
+初始脚本/
+
+node_modules/
+*.log
+.DS_Store
