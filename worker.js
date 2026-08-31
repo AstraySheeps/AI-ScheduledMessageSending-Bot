@@ -859,7 +859,7 @@ export default {
 
     if (p === '/feishu/event') {
       if (request.method === 'GET') return new Response('ok', { headers: { 'content-type': 'text/plain; charset=utf-8' } });
-      return json({ code: 0 });
+      return await handleFeishuEvent(request, env);
     }
     if (p === '/ping') return new Response('pong', { headers: { 'content-type': 'text/plain; charset=utf-8' } });
     return new Response('Not found', { status: 404 });
@@ -1048,6 +1048,92 @@ async function sendTextToReceiver(cfg, text) {
   const receiveType = userId ? 'open_id' : (cfg.receiverEmail ? 'email' : 'open_id');
   const receiveId = userId || cfg.receiverEmail || cfg.openId;
   return await sendMessage(token, receiveType, receiveId, text);
+}
+
+// ===== 飞书消息事件：用户给机器人发消息 → 机器人按人设回复 =====
+async function loadChatMap(env) {
+  try {
+    const s = await env.BOT_KV.get('chatmap');
+    return s ? JSON.parse(s) : {};
+  } catch (e) { return {}; }
+}
+
+async function saveChatMap(env, map) {
+  await env.BOT_KV.put('chatmap', JSON.stringify(map));
+}
+
+async function findUserBySender(env, openId, userId) {
+  const keys = [openId, userId].filter(Boolean);
+  const map = await loadChatMap(env);
+  for (const k of keys) if (map[k]) return map[k];
+
+  const list = await env.BOT_KV.list({ prefix: 'user:' });
+  // 1) 已存 openId
+  for (const k of (list.keys || [])) {
+    const code = k.name.slice('user:'.length);
+    const u = await loadUser(env, code);
+    if (u && u.openId && keys.indexOf(u.openId) >= 0) {
+      map[u.openId] = code;
+      await saveChatMap(env, map);
+      return code;
+    }
+  }
+  // 2) 用邮箱/手机号解析 id 匹配
+  const sys = (await loadSystem(env)) || {};
+  const feishu = sys.feishu || {};
+  if (feishu.appId && feishu.appSecret) {
+    let token = null;
+    try { token = await getFeishuToken({ feishu: feishu }); } catch (e) {}
+    if (token) {
+      for (const k of (list.keys || [])) {
+        const code = k.name.slice('user:'.length);
+        const u = await loadUser(env, code);
+        if (!u || (!u.receiverEmail && !u.receiverMobile)) continue;
+        const resolved = await resolveUserId(u, token);
+        if (resolved && (resolved === openId || resolved === userId)) {
+          u.openId = openId || '';
+          await putUser(env, code, u);
+          map[openId] = code;
+          if (userId) map[userId] = code;
+          await saveChatMap(env, map);
+          return code;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function handleFeishuEvent(request, env) {
+  let body = {};
+  try { body = await request.json(); } catch (e) {}
+  if (body.challenge) return json({ challenge: body.challenge });
+
+  const ev = body.event || {};
+  if (body.type === 'event_callback' && ev.type === 'message' && ev.message && ev.message.message_type === 'text') {
+    const sender = (ev.sender && ev.sender.sender_id) || {};
+    const openId = sender.open_id || '';
+    const userId = sender.user_id || '';
+    if (!openId && !userId) return json({ code: 0 });
+    let content = '';
+    try { content = ((JSON.parse(ev.message.content || '{}')).text || '').trim(); } catch (e) {}
+    if (!content) return json({ code: 0 });
+
+    const code = await findUserBySender(env, openId, userId);
+    if (!code) return json({ code: 0 });
+    const u = await loadUser(env, code);
+    if (!u) return json({ code: 0 });
+    const eff = await effectiveConfig(env, u);
+    if (!eff.apiKey || !eff.feishu || !eff.feishu.appId || !eff.feishu.appSecret) return json({ code: 0 });
+
+    try {
+      const pr = buildOncePrompt(eff.persona, content, beijingNow());
+      const text = await callDeepSeek(eff.apiKey, pr.system, pr.user, pr.temperature, pr.maxTokens);
+      const token = await getFeishuToken(eff);
+      await sendMessage(token, 'open_id', openId || userId, text);
+    } catch (e) {}
+  }
+  return json({ code: 0 });
 }
 
 async function callDeepSeek(apiKey, system, user, temperature, maxTokens) {
