@@ -121,9 +121,9 @@ const USER_HTML = `<!DOCTYPE html>
   <div class="card">
     <h2>立即发送</h2>
     <p class="sub">不等到点，立刻生成或直发一条消息到你的飞书</p>
-    <label>一次性提示词（按人设让 AI 生成后发送）</label>
-    <textarea id="oncePrompt" placeholder="例如：余余今天考砸了不开心，帮我安慰她"></textarea>
-    <button class="btn ghost" id="btnOnce" style="margin-top:10px;">生成并发送</button>
+    <label>召唤 / 一次性提示词（不填=戳一戳召唤，填了=按人设让 AI 回应）</label>
+    <textarea id="oncePrompt" placeholder="不填就是戳一戳；填了例如：余余今天考砸了不开心，帮我安慰她"></textarea>
+    <button class="btn ghost" id="btnOnce" style="margin-top:10px;">戳一戳</button>
     <label style="margin-top:16px;">直接发送（原样发到飞书，不走 AI）</label>
     <input type="text" id="directText" placeholder="例如：hi">
     <button class="btn ghost" id="btnDirect" style="margin-top:10px;">直接发送</button>
@@ -373,20 +373,28 @@ el('logoutBtn').addEventListener('click', function(){
 
 function setSendMsg(t){ if(el('sendMsg')) el('sendMsg').textContent = t; }
 
+function updateOnceBtn(){
+  var has = (el('oncePrompt') ? el('oncePrompt').value.trim() : '') !== '';
+  if(el('btnOnce')) el('btnOnce').textContent = has ? '发送' : '戳一戳';
+}
+if(el('oncePrompt')) el('oncePrompt').addEventListener('input', updateOnceBtn);
+
 el('btnOnce').addEventListener('click', function(){
   var prompt = (el('oncePrompt') ? el('oncePrompt').value : '').trim();
-  if(!prompt){ alert('请先输入提示词'); return; }
   el('btnOnce').disabled = true;
-  setSendMsg('正在生成…');
-  fetch('/api/once', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt: prompt }) })
+  setSendMsg(prompt ? '正在生成…' : '正在戳…');
+  var url = prompt ? '/api/once' : '/api/poke';
+  var body = prompt ? JSON.stringify({ prompt: prompt }) : '{}';
+  fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: body })
     .then(function(r){ return r.json(); })
     .then(function(res){
       el('btnOnce').disabled = false;
-      if(res && res.ok){ setSendMsg('已发送 ✓'); el('oncePrompt').value = ''; }
+      if(res && res.ok){ setSendMsg('已发送 ✓'); el('oncePrompt').value = ''; updateOnceBtn(); }
       else { setSendMsg('失败：' + ((res && res.msg) ? res.msg : JSON.stringify(res))); }
     })
     .catch(function(e){ el('btnOnce').disabled = false; setSendMsg('失败：' + e); });
 });
+updateOnceBtn();
 
 el('btnDirect').addEventListener('click', function(){
   var text = (el('directText') ? el('directText').value : '').trim();
@@ -752,6 +760,24 @@ export default {
       try {
         const p = buildOncePrompt(eff.persona, prompt, beijingNow());
         const text = await callDeepSeek(eff.apiKey, p.system, p.user, p.temperature, p.maxTokens);
+        const resp = await sendTextToReceiver(eff, text);
+        if (resp && resp.code !== 0) return json({ ok: false, msg: '发送失败 code=' + resp.code + '：' + (resp.msg || '未知') });
+        return json({ ok: true, text: text });
+      } catch (e) {
+        return json({ ok: false, msg: (e && e.message) ? e.message : String(e) });
+      }
+    }
+    if (p === '/api/poke' && request.method === 'POST') {
+      const u = await getUserFromCookie(request, env);
+      if (!u) return json({ msg: '未登录' }, 401);
+      const eff = await effectiveConfig(env, u.cfg);
+      if (!eff.apiKey || !(eff.receiverEmail || eff.receiverMobile || eff.openId) || !eff.feishu || !eff.feishu.appId || !eff.feishu.appSecret) {
+        return json({ ok: false, msg: '请先填好接收人与凭据并保存' });
+      }
+      try {
+        const summonPrompt = eff.persona.userName + '想你了，戳了你一下，把你召唤出来了。你像被她叫到一样自然地应她——可以「在呢」「嗯？」「怎么了」应一声，然后接话、报备你正在发生的事、没头没尾想她、或延续聊天。不超过四句，像发微信，别用感叹号。';
+        const pr = buildPrompt(eff.persona, { name: '戳一戳', isRandom: false, prompt: summonPrompt }, beijingNow());
+        const text = await callDeepSeek(eff.apiKey, pr.system, pr.user, pr.temperature, 200);
         const resp = await sendTextToReceiver(eff, text);
         if (resp && resp.code !== 0) return json({ ok: false, msg: '发送失败 code=' + resp.code + '：' + (resp.msg || '未知') });
         return json({ ok: true, text: text });
